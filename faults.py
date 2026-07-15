@@ -20,13 +20,21 @@ from physics import (
 
 
 FAULT_NAMES = frozenset(
-    {"voltage_drop", "bearing_wear", "cooling_failure", "overload"}
+    {
+        "voltage_drop",
+        "bearing_wear",
+        "cooling_failure",
+        "overload",
+        "brush_wear",
+    }
 )
 SEVERITY_RAMP_PER_SECOND = 0.25
 MAX_VOLTAGE_DROP_FRACTION = 0.35
 MAX_BEARING_STATIC_TORQUE_NM = 0.008
 MAX_BEARING_VISCOUS_TORQUE_PER_RPM = 8.0e-7
 MAX_OVERLOAD_TORQUE_NM = 0.025
+MAX_BRUSH_CONTACT_RESISTANCE_OHM = 0.75
+MAX_BRUSH_FRICTION_TORQUE_NM = 0.015
 
 
 @dataclass
@@ -43,6 +51,7 @@ class FaultManager:
     - Bearing wear adds breakaway and speed-dependent friction torque.
     - Cooling failure removes part of the normal heat-rejection path.
     - Overload adds external resisting shaft torque.
+    - Brush wear adds contact resistance, brush drag, and contact heating.
     """
 
     _target: dict[str, float] = field(
@@ -63,6 +72,19 @@ class FaultManager:
     def disable(self, fault: str) -> None:
         """Disable ``fault`` by gradually returning its severity to zero."""
         self._target[self._validate_fault(fault)] = 0.0
+
+    def reset_motor(self, motor: Motor) -> None:
+        """Request gradual recovery by disabling every fault for ``motor``.
+
+        This method deliberately does not call ``motor.reset()`` or overwrite
+        any motor state. The existing ``update`` and physics steps progressively
+        remove fault effects and bring the motor back to normal operation.
+        """
+        if not isinstance(motor, Motor):
+            raise TypeError("reset_motor requires a Motor instance.")
+
+        for fault in self._target:
+            self.disable(fault)
 
     def is_enabled(self, fault: str) -> bool:
         """Return whether ``fault`` has a non-zero requested severity."""
@@ -91,12 +113,23 @@ class FaultManager:
         bearing_wear = self._applied["bearing_wear"]
         cooling_failure = self._applied["cooling_failure"]
         overload = self._applied["overload"]
+        brush_wear = self._applied["brush_wear"]
+
+        # R_brush = severity * R_brush_max: worn brushes develop a larger
+        # contact resistance because their contact surface becomes poorer.
+        brush_contact_resistance = (
+            brush_wear * MAX_BRUSH_CONTACT_RESISTANCE_OHM
+        )
+
+        # V_brush = I * R_brush: contact resistance creates a progressive brush
+        # voltage drop before the remaining voltage reaches the armature.
+        brush_voltage_drop = motor.current * brush_contact_resistance
 
         # V_effective = V_nominal * (1 - 0.35 * severity): a higher source or
         # connector resistance leaves less voltage available at the armature.
         motor.voltage = self._nominal_voltage * (
             1.0 - MAX_VOLTAGE_DROP_FRACTION * voltage_drop
-        )
+        ) - brush_voltage_drop
 
         # T_bearing = severity * (T_static + k_rpm * |RPM|): worn bearings add
         # both breakaway friction and speed-dependent drag to the shaft load.
@@ -105,10 +138,20 @@ class FaultManager:
             + MAX_BEARING_VISCOUS_TORQUE_PER_RPM * abs(motor.rpm)
         )
 
-        # T_load = T_nominal + T_bearing + T_overload: overload represents an
-        # external machine demand that opposes motor rotation.
+        # T_brush = severity * T_brush_max: worn brushes require more sliding
+        # force, lowering RPM and therefore increasing armature current through
+        # the existing back-EMF relationship in the physics model.
+        brush_friction_torque = brush_wear * MAX_BRUSH_FRICTION_TORQUE_NM
+
+        # T_load = T_nominal + T_bearing + T_brush + T_overload: all fault
+        # torques oppose motor rotation through the existing load model.
         overload_torque = overload * MAX_OVERLOAD_TORQUE_NM
-        motor.load = self._nominal_load + bearing_torque + overload_torque
+        motor.load = (
+            self._nominal_load
+            + bearing_torque
+            + brush_friction_torque
+            + overload_torque
+        )
 
         # Delta_T = [severity * (T - T_ambient) / R_th] * dt / C_th: failed
         # cooling retains part of the heat that a healthy motor would reject.
@@ -117,7 +160,19 @@ class FaultManager:
             (motor.temperature - AMBIENT_TEMPERATURE_C)
             / THERMAL_RESISTANCE_C_PER_W,
         )
-        motor.temperature += retained_heat_w * dt / THERMAL_CAPACITANCE_J_PER_C
+
+        # P_brush = I^2 * R_brush: the rising contact resistance produces heat
+        # at the brushes, supplementing the armature copper heat in physics.py.
+        brush_contact_heat_w = motor.current**2 * brush_contact_resistance
+
+        # Delta_T = (P_retained + P_brush) * dt / C_th: fault heat enters the
+        # same thermal state gradually, allowing existing health thresholds to
+        # degrade health only as temperature rises.
+        motor.temperature += (
+            (retained_heat_w + brush_contact_heat_w)
+            * dt
+            / THERMAL_CAPACITANCE_J_PER_C
+        )
 
     def _capture_nominal_inputs(self, motor: Motor) -> None:
         """Store initial fault-free inputs once, before any effects are applied."""
